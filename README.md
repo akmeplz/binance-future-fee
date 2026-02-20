@@ -1,7 +1,7 @@
 # Binance Futures Funding 监控（5秒）
 
 按 5 秒间隔监控币安 **USDT 本位（仅 `marginAsset=USDT` 且 `quoteAsset=USDT`）**在交易永续合约，输出：
-- 合约数量
+- 合约数量（有资金费数据）
 - 平均费率（年化）
 
 并使用 TradingView 的 `lightweight-charts` 生成本地图表页面。

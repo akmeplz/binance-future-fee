@@ -132,16 +132,23 @@ def collect_metrics(symbol_meta: Dict[str, dict], interval_hours_map: Dict[str, 
         row = premium_map.get(symbol)
         if not row:
             continue
+
+        # 只统计有资金费结算信息的永续合约，避免把无 funding 行情的符号计入数量。
+        next_funding_time = row.get("nextFundingTime")
+        if not isinstance(next_funding_time, (int, float)) or next_funding_time <= 0:
+            continue
+
         raw = row.get("lastFundingRate", row.get("fundingRate"))
         try:
             rate = float(raw)
         except (TypeError, ValueError):
             continue
+
         interval_hours = interval_hours_map.get(symbol, 8)
         annualized_values.append(annualize_rate(rate, interval_hours))
 
-    # 合约数量使用目标合约池大小；平均费率使用有有效 funding 数据的合约计算。
-    contract_count = len(symbol_meta)
+    # 数量与平均值保持同口径：均基于有有效 funding 数据的 USDT 永续。
+    contract_count = len(annualized_values)
     avg_annualized = statistics.mean(annualized_values) if annualized_values else 0.0
     return contract_count, avg_annualized
 
