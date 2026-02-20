@@ -133,9 +133,17 @@ def collect_metrics(symbol_meta: Dict[str, dict], interval_hours_map: Dict[str, 
         if not row:
             continue
 
-        # 只统计有资金费结算信息的永续合约，避免把无 funding 行情的符号计入数量。
+        # 仅统计在资金费和标记价格维度都有效的合约，避免包含无效/停牌行情。
         next_funding_time = row.get("nextFundingTime")
         if not isinstance(next_funding_time, (int, float)) or next_funding_time <= 0:
+            continue
+
+        try:
+            mark_price = float(row.get("markPrice"))
+            index_price = float(row.get("indexPrice"))
+        except (TypeError, ValueError):
+            continue
+        if mark_price <= 0 or index_price <= 0:
             continue
 
         raw = row.get("lastFundingRate", row.get("fundingRate"))
