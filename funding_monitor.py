@@ -5,12 +5,15 @@ import statistics
 import sys
 import time
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 BASE_URL = "https://fapi.binance.com"
-USDT_MARGIN_ASSET = "USDT"
+USDT = "USDT"
+DEFAULT_INTERVAL_HOURS = 8
+
 CHART_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -26,7 +29,7 @@ CHART_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <h2>币安永续合约资金费监控</h2>
+  <h2>币安 USDT 永续资金费监控</h2>
   <div id="meta">加载中...</div>
   <div id="chart"></div>
   <script>
@@ -65,113 +68,121 @@ CHART_HTML = """<!doctype html>
 """
 
 
+@dataclass
+class Metrics:
+    contract_count: int
+    avg_annualized: float
+
+
 def fetch_json(path: str, timeout: int = 10):
-    req = urllib.request.Request(BASE_URL + path, headers={"User-Agent": "funding-monitor/2.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    request = urllib.request.Request(BASE_URL + path, headers={"User-Agent": "funding-monitor/3.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def is_target_usdt_perpetual(item: dict, now_ms: int) -> bool:
-    """仅保留 Binance USDT 本位、在交易中的永续合约。"""
-    if item.get("contractType") != "PERPETUAL":
-        return False
-    if item.get("status") != "TRADING":
-        return False
-    if item.get("marginAsset") != USDT_MARGIN_ASSET:
-        return False
-    if item.get("quoteAsset") != "USDT":
-        return False
-
-    symbol = item.get("symbol")
-    if not isinstance(symbol, str) or not symbol.endswith("USDT"):
-        return False
-
-    onboard = item.get("onboardDate")
-    if isinstance(onboard, int) and onboard > now_ms:
-        return False
-
-    return True
-
-
-def get_trading_perpetual_symbols() -> Dict[str, dict]:
-    data = fetch_json("/fapi/v1/exchangeInfo")
-    now_ms = int(time.time() * 1000)
-    symbols = {}
-    for item in data.get("symbols", []):
-        if not is_target_usdt_perpetual(item, now_ms):
-            continue
-        symbols[item["symbol"]] = item
-    return symbols
-
-
-def get_interval_hours_map() -> Dict[str, int]:
-    rows = fetch_json("/fapi/v1/fundingInfo")
-    interval_map: Dict[str, int] = {}
-    for row in rows:
-        symbol = row.get("symbol")
-        hours = row.get("fundingIntervalHours")
-        if symbol and isinstance(hours, int) and hours > 0:
-            interval_map[symbol] = hours
-    return interval_map
-
-
-def get_premium_index_rows() -> List[dict]:
-    data = fetch_json("/fapi/v1/premiumIndex")
-    return data if isinstance(data, list) else []
+def safe_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def annualize_rate(funding_rate: float, interval_hours: int) -> float:
     return funding_rate * (24 / interval_hours) * 365
 
 
-def collect_metrics(symbol_meta: Dict[str, dict], interval_hours_map: Dict[str, int], premium_rows: List[dict]) -> Tuple[int, float]:
-    premium_map = {row.get("symbol"): row for row in premium_rows if row.get("symbol")}
-    annualized_values: List[float] = []
+def get_usdt_perpetual_trading_symbols() -> Dict[str, dict]:
+    payload = fetch_json("/fapi/v1/exchangeInfo")
+    now_ms = int(time.time() * 1000)
+    symbols: Dict[str, dict] = {}
 
-    for symbol in symbol_meta:
-        row = premium_map.get(symbol)
-        if not row:
+    for item in payload.get("symbols", []):
+        if item.get("contractType") != "PERPETUAL":
+            continue
+        if item.get("status") != "TRADING":
+            continue
+        if item.get("marginAsset") != USDT:
+            continue
+        if item.get("quoteAsset") != USDT:
             continue
 
-        # 仅统计在资金费和标记价格维度都有效的合约，避免包含无效/停牌行情。
+        symbol = item.get("symbol")
+        if not isinstance(symbol, str) or not symbol.endswith("USDT"):
+            continue
+
+        onboard_date = item.get("onboardDate")
+        if isinstance(onboard_date, int) and onboard_date > now_ms:
+            continue
+
+        symbols[symbol] = item
+
+    return symbols
+
+
+def get_interval_hours_map() -> Dict[str, int]:
+    rows = fetch_json("/fapi/v1/fundingInfo")
+    result: Dict[str, int] = {}
+    for row in rows:
+        symbol = row.get("symbol")
+        hours = row.get("fundingIntervalHours")
+        if symbol and isinstance(hours, int) and hours > 0:
+            result[symbol] = hours
+    return result
+
+
+def get_premium_rows() -> List[dict]:
+    rows = fetch_json("/fapi/v1/premiumIndex")
+    return rows if isinstance(rows, list) else []
+
+
+def calculate_metrics(
+    symbols: Dict[str, dict],
+    interval_hours_map: Dict[str, int],
+    premium_rows: List[dict],
+) -> Metrics:
+    annualized_values: List[float] = []
+
+    for row in premium_rows:
+        symbol = row.get("symbol")
+        if symbol not in symbols:
+            continue
+
         next_funding_time = row.get("nextFundingTime")
         if not isinstance(next_funding_time, (int, float)) or next_funding_time <= 0:
             continue
 
-        try:
-            mark_price = float(row.get("markPrice"))
-            index_price = float(row.get("indexPrice"))
-        except (TypeError, ValueError):
+        mark_price = safe_float(row.get("markPrice"))
+        index_price = safe_float(row.get("indexPrice"))
+        if mark_price is None or index_price is None:
             continue
         if mark_price <= 0 or index_price <= 0:
             continue
 
-        raw = row.get("lastFundingRate", row.get("fundingRate"))
-        try:
-            rate = float(raw)
-        except (TypeError, ValueError):
+        funding_rate = safe_float(row.get("lastFundingRate"))
+        if funding_rate is None:
+            funding_rate = safe_float(row.get("fundingRate"))
+        if funding_rate is None:
             continue
 
-        interval_hours = interval_hours_map.get(symbol, 8)
-        annualized_values.append(annualize_rate(rate, interval_hours))
+        interval_hours = interval_hours_map.get(symbol, DEFAULT_INTERVAL_HOURS)
+        annualized_values.append(annualize_rate(funding_rate, interval_hours))
 
-    # 数量与平均值保持同口径：均基于有有效 funding 数据的 USDT 永续。
-    contract_count = len(annualized_values)
-    avg_annualized = statistics.mean(annualized_values) if annualized_values else 0.0
-    return contract_count, avg_annualized
+    count = len(annualized_values)
+    avg = statistics.mean(annualized_values) if annualized_values else 0.0
+    return Metrics(contract_count=count, avg_annualized=avg)
 
 
-def write_chart_assets(output_dir: Path):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "chart.html").write_text(CHART_HTML, encoding="utf-8")
+def write_chart_assets(chart_dir: Path):
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    (chart_dir / "chart.html").write_text(CHART_HTML, encoding="utf-8")
 
 
 def load_points(path: Path, max_points: int) -> List[dict]:
     if not path.exists():
         return []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        points = data.get("points", [])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        points = payload.get("points", [])
         return points[-max_points:]
     except Exception:
         return []
@@ -182,50 +193,51 @@ def save_points(path: Path, points: List[dict]):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="5秒监控币安合约数量和平均费率(年化)")
-    parser.add_argument("--interval", type=int, default=5, help="刷新间隔秒数，默认5")
-    parser.add_argument("--symbol-refresh", type=int, default=300, help="合约列表刷新秒数，默认300")
-    parser.add_argument("--chart-dir", default="./chart", help="图表输出目录，默认 ./chart")
-    parser.add_argument("--max-points", type=int, default=720, help="图表最多保留点数，默认720")
-    parser.add_argument("--once", action="store_true")
+    parser = argparse.ArgumentParser(description="每5秒监控 Binance USDT 永续资金费")
+    parser.add_argument("--interval", type=int, default=5, help="刷新间隔秒，默认5")
+    parser.add_argument("--symbol-refresh", type=int, default=300, help="合约列表刷新秒，默认300")
+    parser.add_argument("--chart-dir", default="./chart", help="图表输出目录")
+    parser.add_argument("--max-points", type=int, default=720, help="图表保留最大点数")
+    parser.add_argument("--once", action="store_true", help="仅执行一次")
     args = parser.parse_args()
 
     chart_dir = Path(args.chart_dir)
     data_path = chart_dir / "chart_data.json"
     write_chart_assets(chart_dir)
-
     print(f"TradingView 图表文件: {chart_dir / 'chart.html'}")
 
-    symbol_meta: Dict[str, dict] = {}
+    symbols: Dict[str, dict] = {}
     interval_hours_map: Dict[str, int] = {}
     last_symbol_refresh = 0.0
 
     while True:
         now = time.time()
-        if now - last_symbol_refresh >= args.symbol_refresh or not symbol_meta:
-            symbol_meta = get_trading_perpetual_symbols()
+
+        if now - last_symbol_refresh >= args.symbol_refresh or not symbols:
+            symbols = get_usdt_perpetual_trading_symbols()
             interval_hours_map = get_interval_hours_map()
             last_symbol_refresh = now
 
-        premium_rows = get_premium_index_rows()
-        count, avg_annualized = collect_metrics(symbol_meta, interval_hours_map, premium_rows)
-        ts = int(now)
+        premium_rows = get_premium_rows()
+        metrics = calculate_metrics(symbols, interval_hours_map, premium_rows)
         time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-        print(f"[{time_utc} UTC] 合约数量={count} 平均费率(年化)={avg_annualized * 100:.4f}%")
+        print(f"[{time_utc} UTC] 合约数量={metrics.contract_count} 平均费率(年化)={metrics.avg_annualized * 100:.4f}%")
 
         points = load_points(data_path, args.max_points)
-        points.append({
-            "ts": ts,
-            "time_utc": time_utc,
-            "contract_count": count,
-            "avg_annualized_pct": avg_annualized * 100,
-        })
-        points = points[-args.max_points:]
-        save_points(data_path, points)
+        points.append(
+            {
+                "ts": int(now),
+                "time_utc": time_utc,
+                "contract_count": metrics.contract_count,
+                "avg_annualized_pct": metrics.avg_annualized * 100,
+            }
+        )
+        save_points(data_path, points[-args.max_points :])
 
         if args.once:
             break
+
         time.sleep(args.interval)
 
 

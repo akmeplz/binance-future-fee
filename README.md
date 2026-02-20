@@ -1,10 +1,10 @@
 # Binance Futures Funding 监控（5秒）
 
-按 5 秒间隔监控币安 **USDT 本位（仅 `marginAsset=USDT` 且 `quoteAsset=USDT`）**在交易永续合约，输出：
-- 合约数量（有有效标记价格和资金费数据）
+按 5 秒间隔监控币安 **USDT 永续**，并输出：
+- 合约数量（仅统计当前有有效资金费结算时间、有效标记价/指数价、且费率可解析的 USDT 永续）
 - 平均费率（年化）
 
-并使用 TradingView 的 `lightweight-charts` 生成本地图表页面。
+> 说明：为避免“数量偏大”，数量与平均值使用同一口径（同一批有效 funding 合约）。
 
 ## 运行
 
@@ -12,23 +12,17 @@
 python3 funding_monitor.py
 ```
 
-示例输出（每 5 秒一行）：
-
-```text
-[2026-02-20 10:00:00 UTC] 合约数量=400 平均费率(年化)=12.3456%
-```
-
 ## 图表
 
-脚本启动后会生成：
+脚本会自动生成：
 - `chart/chart.html`
 - `chart/chart_data.json`
 
-本地查看（任选其一）：
+查看方式：
 
 ```bash
 python3 -m http.server 8000 --directory chart
-# 然后打开 http://127.0.0.1:8000/chart.html
+# 打开 http://127.0.0.1:8000/chart.html
 ```
 
 ## 参数
