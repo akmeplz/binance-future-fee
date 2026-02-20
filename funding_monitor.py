@@ -4,16 +4,68 @@ import json
 import statistics
 import sys
 import time
-import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 BASE_URL = "https://fapi.binance.com"
+CHART_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Binance Funding 监控图表</title>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #0b1220; color: #dbe4ff; }
+    h2 { margin: 16px; }
+    #chart { height: 420px; }
+    #meta { margin: 0 16px 16px; opacity: .9; }
+  </style>
+</head>
+<body>
+  <h2>币安永续合约资金费监控</h2>
+  <div id="meta">加载中...</div>
+  <div id="chart"></div>
+  <script>
+    const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+      layout: { background: { color: '#0b1220' }, textColor: '#dbe4ff' },
+      grid: { vertLines: { color: '#1b2a4a' }, horzLines: { color: '#1b2a4a' } },
+      rightPriceScale: { borderColor: '#304b7a' },
+      leftPriceScale: { visible: true, borderColor: '#304b7a' },
+      timeScale: { borderColor: '#304b7a', timeVisible: true, secondsVisible: true },
+    });
+
+    const avgSeries = chart.addLineSeries({ color: '#4da3ff', lineWidth: 2, title: '平均费率(年化%)' });
+    const countSeries = chart.addLineSeries({ color: '#ffd166', lineWidth: 2, title: '合约数量' });
+    countSeries.priceScaleId = 'left';
+
+    async function refresh() {
+      const r = await fetch('./chart_data.json?_=' + Date.now());
+      const data = await r.json();
+      const avg = data.points.map(p => ({ time: p.ts, value: p.avg_annualized_pct }));
+      const cnt = data.points.map(p => ({ time: p.ts, value: p.contract_count }));
+      avgSeries.setData(avg);
+      countSeries.setData(cnt);
+
+      const latest = data.points[data.points.length - 1];
+      document.getElementById('meta').innerText = latest
+        ? `最新: ${latest.time_utc} | 合约数量: ${latest.contract_count} | 平均费率(年化): ${latest.avg_annualized_pct.toFixed(4)}%`
+        : '暂无数据';
+      chart.timeScale().fitContent();
+    }
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
+"""
 
 
 def fetch_json(path: str, timeout: int = 10):
-    req = urllib.request.Request(BASE_URL + path, headers={"User-Agent": "funding-monitor/1.0"})
+    req = urllib.request.Request(BASE_URL + path, headers={"User-Agent": "funding-monitor/2.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -23,27 +75,17 @@ def get_trading_perpetual_symbols() -> Dict[str, dict]:
     now_ms = int(time.time() * 1000)
     symbols = {}
     for item in data.get("symbols", []):
-        if item.get("contractType") != "PERPETUAL":
-            continue
-        if item.get("status") != "TRADING":
-            continue
-        onboard_date = item.get("onboardDate")
-        if isinstance(onboard_date, int) and onboard_date > now_ms:
-            continue
-        symbols[item["symbol"]] = item
+        if item.get("contractType") == "PERPETUAL" and item.get("status") == "TRADING":
+            onboard = item.get("onboardDate")
+            if isinstance(onboard, int) and onboard > now_ms:
+                continue
+            symbols[item["symbol"]] = item
     return symbols
 
 
 def get_interval_hours_map() -> Dict[str, int]:
+    rows = fetch_json("/fapi/v1/fundingInfo")
     interval_map: Dict[str, int] = {}
-    # Binance only returns overridden intervals here; missing symbols default to 8 hours.
-    try:
-        rows = fetch_json("/fapi/v1/fundingInfo")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"获取 fundingInfo 失败: HTTP {e.code}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"获取 fundingInfo 失败: {e.reason}") from e
-
     for row in rows:
         symbol = row.get("symbol")
         hours = row.get("fundingIntervalHours")
@@ -58,106 +100,64 @@ def get_premium_index_rows() -> List[dict]:
 
 
 def annualize_rate(funding_rate: float, interval_hours: int) -> float:
-    settlements_per_year = (24 / interval_hours) * 365
-    return funding_rate * settlements_per_year
+    return funding_rate * (24 / interval_hours) * 365
 
 
-def clear_screen():
-    sys.stdout.write("\033[2J\033[H")
-
-
-def format_pct(value: float) -> str:
-    return f"{value * 100:.2f}%"
-
-
-def collect_snapshot(
-    symbol_meta: Dict[str, dict], interval_hours_map: Dict[str, int], premium_rows: List[dict]
-) -> Tuple[List[Tuple[str, float, int]], List[str]]:
-    records: List[Tuple[str, float, int]] = []
-    warnings: List[str] = []
-
+def collect_metrics(symbol_meta: Dict[str, dict], interval_hours_map: Dict[str, int], premium_rows: List[dict]) -> Tuple[int, float]:
     premium_map = {row.get("symbol"): row for row in premium_rows if row.get("symbol")}
+    annualized_values: List[float] = []
 
     for symbol in symbol_meta:
         row = premium_map.get(symbol)
         if not row:
-            warnings.append(f"{symbol}: 无实时 fundingRate")
             continue
-        rate_raw = row.get("lastFundingRate")
-        if rate_raw is None:
-            rate_raw = row.get("fundingRate")
+        raw = row.get("lastFundingRate", row.get("fundingRate"))
         try:
-            funding_rate = float(rate_raw)
+            rate = float(raw)
         except (TypeError, ValueError):
-            warnings.append(f"{symbol}: fundingRate 非法值 {rate_raw}")
             continue
-
         interval_hours = interval_hours_map.get(symbol, 8)
-        ann = annualize_rate(funding_rate, interval_hours)
-        records.append((symbol, ann, interval_hours))
+        annualized_values.append(annualize_rate(rate, interval_hours))
 
-    return records, warnings
-
-
-def render(snapshot: List[Tuple[str, float, int]], warnings: List[str], updated_at: datetime):
-    clear_screen()
-
-    count = len(snapshot)
-    annualized_values = [x[1] for x in snapshot]
+    count = len(annualized_values)
     avg_annualized = statistics.mean(annualized_values) if annualized_values else 0.0
+    return count, avg_annualized
 
-    by_interval: Dict[int, List[float]] = {}
-    for _, ann, interval in snapshot:
-        by_interval.setdefault(interval, []).append(ann)
 
-    print("币安合约资金费年化监控（实时）")
-    print("=" * 52)
-    print(f"更新时间(UTC): {updated_at.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"合约总数量: {count}")
-    print(f"平均年化: {format_pct(avg_annualized)}")
-    print("-" * 52)
+def write_chart_assets(output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "chart.html").write_text(CHART_HTML, encoding="utf-8")
 
-    if by_interval:
-        print("分结算周期统计:")
-        for interval in sorted(by_interval):
-            vals = by_interval[interval]
-            print(
-                f"  {interval}小时: 数量={len(vals):4d} 平均年化={format_pct(statistics.mean(vals))}"
-            )
-    else:
-        print("暂无数据")
 
-    if snapshot:
-        top = sorted(snapshot, key=lambda x: x[1], reverse=True)[:5]
-        bottom = sorted(snapshot, key=lambda x: x[1])[:5]
-        print("-" * 52)
-        print("年化最高 Top 5:")
-        for symbol, ann, interval in top:
-            print(f"  {symbol:15s} {format_pct(ann):>10s} ({interval}h)")
+def load_points(path: Path, max_points: int) -> List[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        points = data.get("points", [])
+        return points[-max_points:]
+    except Exception:
+        return []
 
-        print("年化最低 Top 5:")
-        for symbol, ann, interval in bottom:
-            print(f"  {symbol:15s} {format_pct(ann):>10s} ({interval}h)")
 
-    if warnings:
-        print("-" * 52)
-        print(f"警告: {len(warnings)} 条（仅显示前 5 条）")
-        for line in warnings[:5]:
-            print("  -", line)
-
+def save_points(path: Path, points: List[dict]):
+    path.write_text(json.dumps({"points": points}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="监控币安所有永续合约资金费年化")
-    parser.add_argument("--interval", type=int, default=15, help="刷新间隔秒数，默认 15")
-    parser.add_argument(
-        "--symbol-refresh", type=int, default=300, help="合约列表刷新秒数（考虑上架/下架），默认 300"
-    )
-    parser.add_argument("--once", action="store_true", help="仅抓取并展示一次")
+    parser = argparse.ArgumentParser(description="5秒监控币安合约数量和平均费率(年化)")
+    parser.add_argument("--interval", type=int, default=5, help="刷新间隔秒数，默认5")
+    parser.add_argument("--symbol-refresh", type=int, default=300, help="合约列表刷新秒数，默认300")
+    parser.add_argument("--chart-dir", default="./chart", help="图表输出目录，默认 ./chart")
+    parser.add_argument("--max-points", type=int, default=720, help="图表最多保留点数，默认720")
+    parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
 
-    if args.interval <= 0 or args.symbol_refresh <= 0:
-        raise SystemExit("interval 和 symbol-refresh 必须是正整数")
+    chart_dir = Path(args.chart_dir)
+    data_path = chart_dir / "chart_data.json"
+    write_chart_assets(chart_dir)
+
+    print(f"TradingView 图表文件: {chart_dir / 'chart.html'}")
 
     symbol_meta: Dict[str, dict] = {}
     interval_hours_map: Dict[str, int] = {}
@@ -171,12 +171,24 @@ def main():
             last_symbol_refresh = now
 
         premium_rows = get_premium_index_rows()
-        snapshot, warnings = collect_snapshot(symbol_meta, interval_hours_map, premium_rows)
-        render(snapshot, warnings, datetime.now(timezone.utc))
+        count, avg_annualized = collect_metrics(symbol_meta, interval_hours_map, premium_rows)
+        ts = int(now)
+        time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        print(f"[{time_utc} UTC] 合约数量={count} 平均费率(年化)={avg_annualized * 100:.4f}%")
+
+        points = load_points(data_path, args.max_points)
+        points.append({
+            "ts": ts,
+            "time_utc": time_utc,
+            "contract_count": count,
+            "avg_annualized_pct": avg_annualized * 100,
+        })
+        points = points[-args.max_points:]
+        save_points(data_path, points)
 
         if args.once:
             break
-
         time.sleep(args.interval)
 
 

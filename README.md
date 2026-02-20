@@ -1,19 +1,10 @@
-# Binance Futures Funding 年化监控
+# Binance Futures Funding 监控（5秒）
 
-实时监控币安**所有在交易中的永续合约**资金费，并按各自结算周期（1h / 4h / 8h）换算年化。
+按 5 秒间隔监控币安所有在交易永续合约，输出：
+- 合约数量
+- 平均费率（年化）
 
-## 功能
-
-- 自动拉取并监控所有 `PERPETUAL` 且 `TRADING` 的合约。
-- 自动识别资金费结算周期：
-  - 优先使用 `/fapi/v1/fundingInfo` 的 `fundingIntervalHours`
-  - 未返回的默认按 8 小时
-- 实时显示：
-  - 平均年化
-  - 合约总数量
-  - 分结算周期统计
-  - 年化最高/最低 Top5
-- 定时刷新合约列表，自动适配上架/下架。
+并使用 TradingView 的 `lightweight-charts` 生成本地图表页面。
 
 ## 运行
 
@@ -21,12 +12,31 @@
 python3 funding_monitor.py
 ```
 
-常用参数：
+示例输出（每 5 秒一行）：
+
+```text
+[2026-02-20 10:00:00 UTC] 合约数量=400 平均费率(年化)=12.3456%
+```
+
+## 图表
+
+脚本启动后会生成：
+- `chart/chart.html`
+- `chart/chart_data.json`
+
+本地查看（任选其一）：
 
 ```bash
-# 每5秒刷新一次显示；每60秒刷新一次合约列表
-python3 funding_monitor.py --interval 5 --symbol-refresh 60
+python3 -m http.server 8000 --directory chart
+# 然后打开 http://127.0.0.1:8000/chart.html
+```
 
-# 只执行一次（用于测试）
-python3 funding_monitor.py --once
+## 参数
+
+```bash
+python3 funding_monitor.py \
+  --interval 5 \
+  --symbol-refresh 300 \
+  --chart-dir ./chart \
+  --max-points 720
 ```
