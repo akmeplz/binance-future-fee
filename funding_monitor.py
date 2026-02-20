@@ -71,19 +71,36 @@ def fetch_json(path: str, timeout: int = 10):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def is_target_usdt_perpetual(item: dict, now_ms: int) -> bool:
+    """仅保留 Binance USDT 本位、在交易中的永续合约。"""
+    if item.get("contractType") != "PERPETUAL":
+        return False
+    if item.get("status") != "TRADING":
+        return False
+    if item.get("marginAsset") != USDT_MARGIN_ASSET:
+        return False
+    if item.get("quoteAsset") != "USDT":
+        return False
+
+    symbol = item.get("symbol")
+    if not isinstance(symbol, str) or not symbol.endswith("USDT"):
+        return False
+
+    onboard = item.get("onboardDate")
+    if isinstance(onboard, int) and onboard > now_ms:
+        return False
+
+    return True
+
+
 def get_trading_perpetual_symbols() -> Dict[str, dict]:
     data = fetch_json("/fapi/v1/exchangeInfo")
     now_ms = int(time.time() * 1000)
     symbols = {}
     for item in data.get("symbols", []):
-        if item.get("contractType") == "PERPETUAL" and item.get("status") == "TRADING":
-            # 仅保留 USDT 保证金永续合约。
-            if item.get("marginAsset") != USDT_MARGIN_ASSET:
-                continue
-            onboard = item.get("onboardDate")
-            if isinstance(onboard, int) and onboard > now_ms:
-                continue
-            symbols[item["symbol"]] = item
+        if not is_target_usdt_perpetual(item, now_ms):
+            continue
+        symbols[item["symbol"]] = item
     return symbols
 
 
@@ -123,9 +140,10 @@ def collect_metrics(symbol_meta: Dict[str, dict], interval_hours_map: Dict[str, 
         interval_hours = interval_hours_map.get(symbol, 8)
         annualized_values.append(annualize_rate(rate, interval_hours))
 
-    count = len(annualized_values)
+    # 合约数量使用目标合约池大小；平均费率使用有有效 funding 数据的合约计算。
+    contract_count = len(symbol_meta)
     avg_annualized = statistics.mean(annualized_values) if annualized_values else 0.0
-    return count, avg_annualized
+    return contract_count, avg_annualized
 
 
 def write_chart_assets(output_dir: Path):

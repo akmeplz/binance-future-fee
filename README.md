@@ -1,6 +1,6 @@
 # Binance Futures Funding 监控（5秒）
 
-按 5 秒间隔监控币安 **USDT 保证金**在交易永续合约，输出：
+按 5 秒间隔监控币安 **USDT 本位（仅 `marginAsset=USDT` 且 `quoteAsset=USDT`）**在交易永续合约，输出：
 - 合约数量
 - 平均费率（年化）
 
