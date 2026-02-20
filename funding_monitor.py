@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 BASE_URL = "https://fapi.binance.com"
-USD_STABLE_MARGIN_ASSETS = {"USDT", "BUSD", "USDC", "FDUSD", "USDP", "TUSD"}
+USDT_MARGIN_ASSET = "USDT"
 CHART_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -77,8 +77,8 @@ def get_trading_perpetual_symbols() -> Dict[str, dict]:
     symbols = {}
     for item in data.get("symbols", []):
         if item.get("contractType") == "PERPETUAL" and item.get("status") == "TRADING":
-            # 仅保留 USDⓈ-M（稳定币保证金）合约，排除 coin-margined 类型。
-            if item.get("marginAsset") not in USD_STABLE_MARGIN_ASSETS:
+            # 仅保留 USDT 保证金永续合约。
+            if item.get("marginAsset") != USDT_MARGIN_ASSET:
                 continue
             onboard = item.get("onboardDate")
             if isinstance(onboard, int) and onboard > now_ms:
