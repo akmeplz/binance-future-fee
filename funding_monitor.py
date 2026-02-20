@@ -135,6 +135,18 @@ def get_premium_rows() -> List[dict]:
     return rows if isinstance(rows, list) else []
 
 
+def get_active_24h_ticker_symbols() -> set[str]:
+    rows = fetch_json("/fapi/v1/ticker/24hr")
+    if not isinstance(rows, list):
+        return set()
+    symbols = set()
+    for row in rows:
+        symbol = row.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            symbols.add(symbol)
+    return symbols
+
+
 def calculate_metrics(
     symbols: Dict[str, dict],
     interval_hours_map: Dict[str, int],
@@ -167,7 +179,8 @@ def calculate_metrics(
         interval_hours = interval_hours_map.get(symbol, DEFAULT_INTERVAL_HOURS)
         annualized_values.append(annualize_rate(funding_rate, interval_hours))
 
-    count = len(annualized_values)
+    # 数量口径：当前可交易 USDT 永续合约池（与交易端列表更一致）。
+    count = len(symbols)
     avg = statistics.mean(annualized_values) if annualized_values else 0.0
     return Metrics(contract_count=count, avg_annualized=avg)
 
@@ -215,6 +228,9 @@ def main():
 
         if now - last_symbol_refresh >= args.symbol_refresh or not symbols:
             symbols = get_usdt_perpetual_trading_symbols()
+            active_24h = get_active_24h_ticker_symbols()
+            if active_24h:
+                symbols = {k: v for k, v in symbols.items() if k in active_24h}
             interval_hours_map = get_interval_hours_map()
             last_symbol_refresh = now
 
